@@ -266,7 +266,11 @@ class ClientOrderTracker:
             else:
                 self.logger().debug(f"Order is not/no longer being tracked ({client_order_id})")
 
-    async def _process_order_update(self, order_update: OrderUpdate):
+    async def _process_order_update(self, order_update: Optional[OrderUpdate]):
+        if order_update is None:
+            self.logger().error("Received None as OrderUpdate, unable to process.")
+            return
+
         if not order_update.client_order_id and not order_update.exchange_order_id:
             self.logger().error("OrderUpdate does not contain any client_order_id or exchange_order_id", exc_info=True)
             return
@@ -276,33 +280,19 @@ class ClientOrderTracker:
         )
 
         if tracked_order:
-            if order_update.new_state == OrderState.FILLED and not tracked_order.is_done:
-                try:
-                    await asyncio.wait_for(
-                        tracked_order.wait_until_completely_filled(), timeout=self.TRADE_FILLS_WAIT_TIMEOUT
-                    )
-                except asyncio.TimeoutError:
-                    self.logger().warning(
-                        f"The order fill updates did not arrive on time for {tracked_order.client_order_id}. "
-                        f"The complete update will be processed with incomplete information."
-                    )
-
+            self.logger().info(f"Processing update for order: {order_update}")
+            
             previous_state: OrderState = tracked_order.current_state
-
             updated: bool = tracked_order.update_with_order_update(order_update)
+
             if updated:
+                self.logger().info(f"Order {tracked_order.client_order_id} updated from {previous_state} to {order_update.new_state}")
                 self._trigger_order_creation(tracked_order, previous_state, order_update.new_state)
                 self._trigger_order_completion(tracked_order, order_update)
         else:
-            lost_order = self.fetch_lost_order(
-                client_order_id=order_update.client_order_id, exchange_order_id=order_update.exchange_order_id
-            )
-            if lost_order:
-                if order_update.new_state in [OrderState.CANCELED, OrderState.FILLED, OrderState.FAILED]:
-                    # If the order officially reaches a final state after being lost it should be removed from the lost list
-                    del self._lost_orders[lost_order.client_order_id]
-            else:
-                self.logger().debug(f"Order is not/no longer being tracked ({order_update})")
+            self.logger().warning(f"Untracked order update received: {order_update}")
+
+
 
     def _trigger_created_event(self, order: InFlightOrder):
         event_tag = MarketEvent.BuyOrderCreated if order.trade_type is TradeType.BUY else MarketEvent.SellOrderCreated
@@ -409,6 +399,13 @@ class ClientOrderTracker:
                 f"The {tracked_order.trade_type.name.upper()} order {tracked_order.client_order_id} "
                 f"amounting to {tracked_order.executed_amount_base}/{tracked_order.amount} {tracked_order.base_asset} "
                 f"has been filled at {fill_price} {tracked_order.quote_asset}."
+            )
+            self.logger().info(
+                f"Order {tracked_order.client_order_id}: Incremental fill: {fill_amount} {tracked_order.base_asset} at {fill_price} {tracked_order.quote_asset}."
+            )
+
+            self.logger().info(
+                f"Order {tracked_order.client_order_id}: Cumulative filled amount: {tracked_order.executed_amount_base}/{tracked_order.amount}."
             )
             self._trigger_filled_event(
                 order=tracked_order,
