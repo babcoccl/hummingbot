@@ -193,7 +193,7 @@ class BitmartExchange(ExchangePyBase):
                       "type": "limit",
                       "size": f"{amount:f}",
                       "price": f"{price:f}",
-                      "clientOrderId": order_id,
+                      "client_order_id": order_id,
                       }
         order_result = await self._api_post(
             path_url=CONSTANTS.CREATE_ORDER_PATH_URL,
@@ -203,15 +203,36 @@ class BitmartExchange(ExchangePyBase):
 
         return exchange_order_id, self.current_timestamp
 
-    async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
-        api_params = {
-            "clientOrderId": order_id,
-        }
-        cancel_result = await self._api_post(
-            path_url=CONSTANTS.CANCEL_ORDER_PATH_URL,
-            data=api_params,
-            is_auth_required=True)
-        return cancel_result.get("data", {}).get("result", False)
+    async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder) -> bool:
+        """
+        Sends a cancellation request to the exchange and returns whether the cancellation was successful.
+        """
+        try:
+            api_params = {
+                "symbol": await self.exchange_symbol_associated_to_pair(tracked_order.trading_pair),
+                "client_order_id": order_id,
+            }
+            cancel_result = await self._api_post(
+                path_url=CONSTANTS.CANCEL_ORDER_PATH_URL,
+                data=api_params,
+                is_auth_required=True,
+            )
+            return cancel_result.get("data", {}).get("result", False)
+        except OSError as e:
+            error_message = str(e)
+            if "50031" in error_message: 
+                self.logger().info(f"Order {order_id} is already completed. Marking as completed.")
+                self._order_tracker.process_order_update(
+                    OrderUpdate(
+                        client_order_id=order_id,
+                        exchange_order_id=tracked_order.exchange_order_id,
+                        trading_pair=tracked_order.trading_pair,
+                        update_timestamp=self.current_timestamp,
+                        new_state=OrderState.FILLED,
+                    )
+                )
+                return True
+            raise
 
     async def _format_trading_rules(self, symbols_details: Dict[str, Any]) -> List[TradingRule]:
         """
@@ -287,18 +308,24 @@ class BitmartExchange(ExchangePyBase):
             del self._account_balances[asset_name]
 
     async def _request_order_update(self, order: InFlightOrder) -> Dict[str, Any]:
-        return await self._api_get(
-            path_url=CONSTANTS.GET_ORDER_DETAIL_PATH_URL,
-            params={"order_id": order.exchange_order_id},
-            is_auth_required=True)
+        try:
+            response = await self._api_post(
+                path_url=CONSTANTS.GET_ORDER_DETAIL_PATH_URL,
+                data={"orderId": order.exchange_order_id},
+                is_auth_required=True
+            )
+            if not response or "data" not in response:
+                self.logger().error(f"Invalid response for order {order.client_order_id}: {response}")
+                return {}
+            return response
+        except Exception as e:
+            self.logger().error(f"Error fetching order update for {order.client_order_id}: {e}")
+            return {}
 
     async def _request_order_fills(self, order: InFlightOrder) -> Dict[str, Any]:
-        return await self._api_request(
-            method=RESTMethod.GET,
+        return await self._api_post(
             path_url=CONSTANTS.GET_TRADE_DETAIL_PATH_URL,
-            params={
-                "symbol": await self.exchange_symbol_associated_to_pair(order.trading_pair),
-                "order_id": await order.get_exchange_order_id()},
+            data={"symbol": await self.exchange_symbol_associated_to_pair(order.trading_pair)},
             is_auth_required=True)
 
     async def _all_trade_updates_for_order(self, order: InFlightOrder) -> List[TradeUpdate]:
@@ -318,33 +345,85 @@ class BitmartExchange(ExchangePyBase):
 
         return trade_updates
 
-    async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
-        updated_order_data = await self._request_order_update(order=tracked_order)
+    async def _request_order_status(self, tracked_order: InFlightOrder) -> Optional[OrderUpdate]:
+        try:
+            updated_order_data = await self._request_order_update(order=tracked_order)
 
-        order_update = self._create_order_update(order=tracked_order, order_update=updated_order_data)
-        return order_update
+            if not updated_order_data or "data" not in updated_order_data:
+                self.logger().error(
+                    f"Order status response missing 'data' for order {tracked_order.client_order_id}: {updated_order_data}"
+                )
+                return None
+
+            order_data = updated_order_data["data"]
+            state_field = order_data.get("order_state", order_data.get("state"))
+
+            if state_field is None:
+                self.logger().error(f"Missing 'order_state' or 'state' in response: {order_data}")
+                return None
+
+            # Log the raw data for debugging
+            self.logger().info(f"Raw order status response for {tracked_order.client_order_id}: {order_data}")
+
+            # Map the state to OrderState or log unknown states
+            new_state = CONSTANTS.ORDER_STATE.get(str(state_field), OrderState.UNKNOWN)
+            if new_state == OrderState.UNKNOWN:
+                self.logger().warning(
+                    f"Unknown state '{state_field}' encountered for order {tracked_order.client_order_id}. Response: {order_data}"
+                )
+                return None
+
+            return OrderUpdate(
+                client_order_id=tracked_order.client_order_id,
+                exchange_order_id=str(order_data.get("orderId", "UNKNOWN")),
+                trading_pair=tracked_order.trading_pair,
+                update_timestamp=self.current_timestamp,
+                new_state=new_state,
+            )
+        except Exception as e:
+            self.logger().error(f"Error fetching status for order {tracked_order.client_order_id}: {e}", exc_info=True)
+            return None
 
     def _create_order_fill_updates(self, order: InFlightOrder, fill_update: Dict[str, Any]) -> List[TradeUpdate]:
         updates = []
-        fills_data = fill_update["data"]["trades"]
+        try:
+            # Handle when "data" is a list
+            if isinstance(fill_update["data"], list):
+                fills_data = fill_update["data"]
+            elif "trades" in fill_update["data"]:
+                fills_data = fill_update["data"]["trades"]
+            else:
+                raise KeyError("'data' or 'trades' not found in fill_update")
+        except Exception as e:
+            self.logger().error(f"Error in fill_update structure: {e}, fill_update: {fill_update}")
+            return updates
 
         for fill_data in fills_data:
+            trade_id = str(fill_data.get("tradeId"))
+
+            # Ensure the trade has not been processed before
+            if trade_id in order.processed_trade_ids:
+                self.logger().info(f"Duplicate trade detected: {trade_id}, skipping...")
+                continue
+
+            order.processed_trade_ids.add(trade_id)
+
             fee = TradeFeeBase.new_spot_fee(
                 fee_schema=self.trade_fee_schema(),
                 trade_type=order.trade_type,
-                percent_token=fill_data["fee_coin_name"],
-                flat_fees=[TokenAmount(amount=Decimal(fill_data["fees"]), token=fill_data["fee_coin_name"])]
+                percent_token=fill_data.get("feeCoinName", ""),
+                flat_fees=[TokenAmount(amount=Decimal(fill_data.get("fee", "0")), token=fill_data.get("feeCoinName", ""))]
             )
             trade_update = TradeUpdate(
-                trade_id=str(fill_data["detail_id"]),
+                trade_id=trade_id,
                 client_order_id=order.client_order_id,
-                exchange_order_id=str(fill_data["order_id"]),
+                exchange_order_id=str(fill_data.get("orderId")),
                 trading_pair=order.trading_pair,
                 fee=fee,
-                fill_base_amount=Decimal(fill_data["size"]),
-                fill_quote_amount=Decimal(fill_data["size"]) * Decimal(fill_data["price_avg"]),
-                fill_price=Decimal(fill_data["price_avg"]),
-                fill_timestamp=int(fill_data["create_time"]) * 1e-3,
+                fill_base_amount=Decimal(fill_data.get("size", "0")),
+                fill_quote_amount=Decimal(fill_data.get("notional", "0")),
+                fill_price=Decimal(fill_data.get("price", "0")),
+                fill_timestamp=int(fill_data.get("createTime", 0)) * 1e-3,
             )
             updates.append(trade_update)
 
@@ -365,56 +444,49 @@ class BitmartExchange(ExchangePyBase):
     async def _user_stream_event_listener(self):
         async for event_message in self._iter_user_event_queue():
             try:
+                # Log the incoming message
+                self.logger().info(f"User stream event received: {event_message}")
+
                 event_type = event_message.get("table")
                 execution_data = event_message.get("data", [])
 
-                # Refer to https://developer-pro.bitmart.com/en/spot/#private-order-progress
                 if event_type == CONSTANTS.PRIVATE_ORDER_PROGRESS_CHANNEL_NAME:
                     for each_event in execution_data:
                         try:
-                            client_order_id: Optional[str] = each_event.get("client_order_id")
-                            fillable_order = self._order_tracker.all_fillable_orders.get(client_order_id)
+                            client_order_id = each_event.get("client_order_id")
+                            state_field = each_event.get("order_state", each_event.get("state"))
+
+                            if state_field is None:
+                                self.logger().warning(f"State field missing in event: {each_event}")
+                                continue
+
+                            new_state = CONSTANTS.ORDER_STATE.get(str(state_field))
+
+                            if new_state is None:
+                                self.logger().warning(f"Unmapped order state: {state_field}")
+                                new_state = OrderState.UNKNOWN
+
                             updatable_order = self._order_tracker.all_updatable_orders.get(client_order_id)
-
-                            new_state = CONSTANTS.ORDER_STATE[each_event["state"]]
-                            event_timestamp = int(each_event["ms_t"]) * 1e-3
-
-                            if fillable_order is not None:
-                                is_fill_candidate_by_state = new_state in [OrderState.PARTIALLY_FILLED,
-                                                                           OrderState.FILLED]
-                                is_fill_candidate_by_amount = fillable_order.executed_amount_base < Decimal(
-                                    each_event["filled_size"])
-                                if is_fill_candidate_by_state and is_fill_candidate_by_amount:
-                                    try:
-                                        trade_fills: Dict[str, Any] = await self._request_order_fills(fillable_order)
-                                        trade_updates = self._create_order_fill_updates(
-                                            order=fillable_order,
-                                            fill_update=trade_fills)
-                                        for trade_update in trade_updates:
-                                            self._order_tracker.process_trade_update(trade_update)
-                                    except asyncio.CancelledError:
-                                        raise
-                                    except Exception:
-                                        self.logger().exception("Unexpected error requesting order fills for "
-                                                                f"{fillable_order.client_order_id}")
-                            if updatable_order is not None:
+                            if updatable_order:
                                 order_update = OrderUpdate(
                                     trading_pair=updatable_order.trading_pair,
-                                    update_timestamp=event_timestamp,
+                                    update_timestamp=self.current_timestamp,
                                     new_state=new_state,
                                     client_order_id=client_order_id,
-                                    exchange_order_id=each_event["order_id"],
+                                    exchange_order_id=each_event.get("order_id"),
                                 )
+                                self.logger().info(f"Processing order update: {order_update}")
                                 self._order_tracker.process_order_update(order_update=order_update)
-
-                        except asyncio.CancelledError:
-                            raise
-                        except Exception:
-                            self.logger().exception("Unexpected error in user stream listener loop.")
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                self.logger().exception("Unexpected error in user stream listener loop.")
+                            else:
+                                self.logger().info(
+                                    f"Order {client_order_id} not tracked or already completed. Event: {each_event}"
+                                )
+                        except Exception as e:
+                            self.logger().exception(
+                                f"Error processing individual user stream event: {each_event}. Error: {e}"
+                            )
+            except Exception as e:
+                self.logger().exception(f"Unexpected error in user stream event listener loop: {e}")
 
     def _initialize_trading_pair_symbols_from_exchange_info(self, exchange_info: Dict[str, Any]):
         mapping = bidict()

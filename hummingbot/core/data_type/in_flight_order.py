@@ -112,6 +112,7 @@ class InFlightOrder:
         self.current_state = initial_state
         self.leverage = leverage
         self.position = position
+        self.processed_trade_ids = set()
 
         self.executed_amount_base = s_decimal_0
         self.executed_amount_quote = s_decimal_0
@@ -338,23 +339,22 @@ class InFlightOrder:
 
     def update_with_trade_update(self, trade_update: TradeUpdate) -> bool:
         """
-        Updates the in flight order with a trade update (from REST API or WS API)
-        :return: True if the order gets updated otherwise False
+        Updates the order with a trade update. Ensures the same trade is not processed multiple times.
         """
-        trade_id: str = trade_update.trade_id
-
-        if (trade_id in self.order_fills
-                or (self.client_order_id != trade_update.client_order_id
-                    and self.exchange_order_id != trade_update.exchange_order_id)):
+        if trade_update.trade_id in self.processed_trade_ids:
+            # Trade already processed, skip further updates
             return False
 
-        self.order_fills[trade_id] = trade_update
+        # Mark the trade as processed
+        self.processed_trade_ids.add(trade_update.trade_id)
 
+        # Update executed amounts
         self.executed_amount_base += trade_update.fill_base_amount
         self.executed_amount_quote += trade_update.fill_quote_amount
 
-        self.last_update_timestamp = trade_update.fill_timestamp
-        self.check_filled_condition()
+        # Check if the order is fully filled
+        if self.executed_amount_base >= self.amount:
+            self.current_state = OrderState.FILLED
 
         return True
 
